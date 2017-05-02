@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -24,10 +25,11 @@ type CfgMgr interface {
 	Watch() error                                                       //监视资源变动，变动后要重新调用
 }
 
-const gCFGPATH = "/cbs/gcfg" //全局配置路径，各个节点互相感知
-const gZKSEP = "/"           //zk的path分割符号
-const gCBSSEP = ":"          //cbs内部拼接的符号
-const gFlagFix = 0           //不是临时节点
+const gCATGORY = "/cbs"                     //分类路径
+const gZKSEP = "/"                          //zk的path分割符号
+const gCFGPATH = gCATGORY + gZKSEP + "gcfg" //全局配置路径，各个节点互相感知
+const gCBSSEP = ":"                         //cbs内部拼接的符号
+const gFlagFix = 0                          //不是临时节点
 
 type cbsCfgMgr struct {
 	conn     *zk.Conn
@@ -92,12 +94,54 @@ func (t *cbsCfgMgr) UpdateGlobalCfg(cfg *string) error {
 	_, err := t.conn.Set(t.gPath, []byte(*cfg), 0)
 	return err
 }
+
+// 是否需要delete节点函数：包括所有子孙节点
 func (t *cbsCfgMgr) UpdateInstCfg(cfg *string) error {
 	//这个可以不用临时的，客户端退出后仍然存在， 新客户取到该id后，决定是否更新内容
 	//不用临时的，可以用tree，不像gcfg中临时的，只能有一个值
+	var tree map[string]interface{}
+	if err := json.Unmarshal([]byte(*cfg), &tree); err != nil {
+		return err
+	}
+	instPath := gCATGORY + gZKSEP + t.nodeType + gCBSSEP + strconv.Itoa(t.nodeid)
+	if err := t.createPath(instPath); err != nil {
+		return err
+	}
+
+	pathMap := map[string]string{}
+	t.parseMap(pathMap, instPath, tree)
+
+	//保证上层路径先建立
+	var keys []string
+	for k := range pathMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		if bExist, _, _ := t.conn.Exists(k); bExist {
+			continue
+		}
+		if _, err := t.conn.Create(k, []byte(pathMap[k]), gFlagFix, zk.WorldACL(zk.PermAll)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
-
+func (t *cbsCfgMgr) parseMap(pathMap map[string]string, path string, aMap map[string]interface{}) {
+	for key, val := range aMap {
+		thisPath := path + gZKSEP + key
+		switch val := val.(type) {
+		case map[string]interface{}:
+			pathMap[thisPath] = ""
+			t.parseMap(pathMap, thisPath, val)
+		case []interface{}:
+			//parseArray  应该没有吧
+		default:
+			pathMap[thisPath] = val.(string)
+		}
+	}
+}
 func (t *cbsCfgMgr) createPath(path string) error {
 	pathList := strings.Split(path, gZKSEP)
 	abspath := ""
@@ -106,11 +150,10 @@ func (t *cbsCfgMgr) createPath(path string) error {
 	defer lock.Unlock()
 	for _, v := range pathList[1:] {
 		abspath = abspath + gZKSEP + v
-		bExist, _, err := t.conn.Exists(path)
-		if bExist {
+		if bExist, _, _ := t.conn.Exists(abspath); bExist {
 			continue
 		}
-		if _, err = t.conn.Create(abspath, nil, gFlagFix, zk.WorldACL(zk.PermAll)); err != nil {
+		if _, err := t.conn.Create(abspath, nil, gFlagFix, zk.WorldACL(zk.PermAll)); err != nil {
 			return err
 		}
 	}
@@ -118,9 +161,8 @@ func (t *cbsCfgMgr) createPath(path string) error {
 }
 func (t *cbsCfgMgr) CreateNode(nodeType string, startNum int, cfg *string) (int, error) {
 	path := gCFGPATH
-	bExist, _, err := t.conn.Exists(path)
-	if !bExist {
-		if err = t.createPath(path); err != nil {
+	if bExist, _, _ := t.conn.Exists(path); !bExist {
+		if err := t.createPath(path); err != nil {
 			return 0, err
 		}
 	}
@@ -132,6 +174,7 @@ func (t *cbsCfgMgr) CreateNode(nodeType string, startNum int, cfg *string) (int,
 	if err != nil {
 		return 0, nil
 	}
+	t.nodeType = nodeType
 	t.nodeid = t.getIdleNode(idlist, nodeType, startNum)
 	t.gPath = path + gZKSEP + nodeType + gCBSSEP + strconv.Itoa(t.nodeid)
 	if _, err := t.conn.Create(t.gPath, []byte(*cfg), zk.FlagEphemeral, zk.WorldACL(zk.PermAll)); err != nil {
